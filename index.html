@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Cyber Yorker: Arcade Edition</title>
+    <style>
+        body, html {
+            margin: 0; padding: 0; width: 100%; height: 100%;
+            background-color: #020205; overflow: hidden;
+            font-family: 'Courier New', Courier, monospace;
+            touch-action: none; user-select: none;
+        }
+        canvas { display: block; z-index: 1; position: relative; }
+        
+        #crt-overlay {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%), linear-gradient(90deg, rgba(255, 0, 0, 0.06), rgba(0, 255, 0, 0.02), rgba(0, 0, 255, 0.06));
+            background-size: 100% 4px, 6px 100%;
+            z-index: 10; pointer-events: none;
+            box-shadow: inset 0 0 100px rgba(0,0,0,0.9);
+        }
+        
+        #ui-layer {
+            position: absolute; top: 20px; left: 20px; z-index: 5;
+            pointer-events: none;
+        }
+        .text-glow { text-shadow: 0 0 10px currentColor, 0 0 20px currentColor; }
+        h1 { margin: 0; font-size: 28px; color: #0ff; font-weight: bold; }
+        h2 { margin: 5px 0 0 0; font-size: 16px; color: #f0f; }
+        h3 { margin: 5px 0 0 0; font-size: 20px; color: #ff0; display: none; }
+        
+        #start-screen {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            display: flex; flex-direction: column; justify-content: center; align-items: center;
+            color: #fff; z-index: 20; background: rgba(0,0,0,0.7);
+        }
+        .blink { animation: blinker 1s linear infinite; }
+        @keyframes blinker { 50% { opacity: 0; } }
+    </style>
+</head>
+<body>
+    <div id="crt-overlay"></div>
+    
+    <div id="ui-layer">
+        <h1 id="scoreDisplay" class="text-glow">SCORE: 0</h1>
+        <h2 id="highScoreDisplay" class="text-glow">HIGH SCORE: 0</h2>
+        <h3 id="comboDisplay" class="text-glow">COMBO x1</h3>
+    </div>
+
+    <div id="start-screen">
+        <h1 class="text-glow" style="font-size: 40px; margin-bottom: 20px; color: #f0f;">CYBER YORKER</h1>
+        <p class="blink">TAP TO START & ENABLE AUDIO</p>
+    </div>
+
+    <canvas id="gameCanvas"></canvas>
+
+    <script>
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+        const scoreUI = document.getElementById('scoreDisplay');
+        const highScoreUI = document.getElementById('highScoreDisplay');
+        const comboUI = document.getElementById('comboDisplay');
+        const startScreen = document.getElementById('start-screen');
+
+        let isPlaying = false;
+        let score = 0;
+        let combo = 1;
+        let highScore = localStorage.getItem('cyberYorkerProScore') || 0;
+        highScoreUI.innerText = `HIGH SCORE: ${highScore}`;
+
+        let shakeTime = 0;
+        let particles = [];
+        let trails = [];
+        let floatingTexts = [];
+
+        // --- Pointer Tracking ---
+        const pointer = { x: window.innerWidth / 2, y: 0 };
+        window.addEventListener('mousemove', (e) => { pointer.x = e.clientX; pointer.y = e.clientY; });
+        window.addEventListener('touchmove', (e) => { pointer.x = e.touches[0].clientX; pointer.y = e.touches[0].clientY; }, {passive: false});
+
+        // --- Web Audio API Synthesizer ---
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        
+        function playSynth(type, freq, duration, slide = 0) {
+            if (audioCtx.state === 'suspended') audioCtx.resume();
+            const osc = audioCtx.createOscillator();
+            const gainNode = audioCtx.createGain();
+            
+            osc.type = type;
+            osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
+            if (slide !== 0) {
+                let targetFreq = Math.max(1, freq + slide);
+                osc.frequency.linearRampToValueAtTime(targetFreq, audioCtx.currentTime + duration);
+            }
+            
+            gainNode.gain.setValueAtTime(0.15, audioCtx.currentTime);
+            gainNode.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + duration);
+            
+            osc.connect(gainNode);
+            gainNode.connect(audioCtx.destination);
+            osc.start();
+            osc.stop(audioCtx.currentTime + duration);
+        }
+
+        const sfx = {
+            shoot: () => playSynth('square', 300, 0.1, -150),
+            hit: (multiplier) => playSynth('sawtooth', 400 + (multiplier * 50), 0.25, 200),
+            shield: () => playSynth('triangle', 150, 0.3, -50),
+            miss: () => playSynth('sine', 200, 0.5, -150)
+        };
+
+        // --- Entities ---
+        const target = { width: 90, height: 25, x: 0, y: 100, speed: 4.5, dx: 1, color: '#0ff' };
+        const shield = { width: 50, height: 15, x: 0, y: 150, speed: 6, dx: -1, color: '#f00' };
+        
+        // Added vx and vy for directional movement
+        const ball = { radius: 10, x: 0, y: 0, vx: 0, vy: 0, speed: 22, isFired: false, color: '#fff' };
+        
+        // Added the Gun entity
+        const gun = { width: 24, height: 45, yOffset: 0, color: '#444' };
+
+        function resize() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+            resetBall();
+        }
+        window.addEventListener('resize', resize);
+
+        function resetBall() {
+            ball.x = canvas.width / 2;
+            ball.y = canvas.height - 60;
+            ball.isFired = false;
+        }
+
+        function spawnFloatingText(x, y, text, color) {
+            floatingTexts.push({ x, y, text, color, life: 1.0, dy: -2 });
+        }
+
+        function explode(x, y, color) {
+            for (let i = 0; i < 40; i++) {
+                particles.push({
+                    x: x, y: y,
+                    vx: (Math.random() - 0.5) * 20,
+                    vy: (Math.random() - 0.5) * 20,
+                    life: 1,
+                    color: Math.random() > 0.2 ? color : '#fff'
+                });
+            }
+        }
+
+        function resetCombo() {
+            combo = 1;
+            comboUI.style.display = 'none';
+            target.speed = 4.5;
+            shield.speed = 6;
+        }
+
+        function triggerAction() {
+            if (!isPlaying) {
+                isPlaying = true;
+                startScreen.style.display = 'none';
+                if (audioCtx.state === 'suspended') audioCtx.resume();
+                return;
+            }
+
+            if (!ball.isFired) {
+                ball.isFired = true;
+                gun.yOffset = 20; // Recoil effect
+                
+                // Calculate angle from the gun to the pointer
+                let pivotX = canvas.width / 2;
+                let pivotY = canvas.height - 15;
+                let angle = Math.atan2(pointer.y - pivotY, pointer.x - pivotX);
+                
+                // Set velocity based on angle
+                ball.vx = Math.cos(angle) * ball.speed;
+                ball.vy = Math.sin(angle) * ball.speed;
+                
+                sfx.shoot();
+            }
+        }
+
+        window.addEventListener('mousedown', triggerAction);
+        window.addEventListener('touchstart', (e) => { e.preventDefault(); triggerAction(); }, {passive: false});
+
+        function checkCollision(rect) {
+            return (ball.y - ball.radius <= rect.y + rect.height &&
+                    ball.y + ball.radius >= rect.y &&
+                    ball.x >= rect.x && 
+                    ball.x <= rect.x + rect.width);
+        }
+
+        function update() {
+            if (!isPlaying) return;
+
+            // Recover gun recoil
+            if (gun.yOffset > 0) gun.yOffset -= 1.5;
+
+            // Move Target & Shield
+            target.x += target.speed * target.dx;
+            if (target.x <= 0 || target.x + target.width >= canvas.width) target.dx *= -1;
+
+            shield.x += shield.speed * shield.dx;
+            if (shield.x <= 0 || shield.x + shield.width >= canvas.width) shield.dx *= -1;
+
+            if (ball.isFired) {
+                trails.push({x: ball.x, y: ball.y, life: 1});
+                
+                // Apply directional velocity
+                ball.x += ball.vx;
+                ball.y += ball.vy;
+
+                // Hit Shield
+                if (checkCollision(shield)) {
+                    sfx.shield();
+                    shakeTime = 10;
+                    explode(ball.x, ball.y, shield.color);
+                    spawnFloatingText(ball.x, ball.y, "BLOCKED!", "#f00");
+                    resetCombo();
+                    resetBall();
+                }
+                // Hit Target
+                else if (checkCollision(target)) {
+                    sfx.hit(combo);
+                    shakeTime = 15;
+                    
+                    let pointsEarned = 10 * combo;
+                    score += pointsEarned;
+                    
+                    explode(ball.x, ball.y, target.color);
+                    spawnFloatingText(ball.x, ball.y, `+${pointsEarned}`, "#0ff");
+                    
+                    if (combo > 1) spawnFloatingText(canvas.width/2, 250, `${combo}x STREAK!`, "#ff0");
+
+                    combo++;
+                    comboUI.style.display = 'block';
+                    comboUI.innerText = `COMBO x${combo}`;
+                    
+                    scoreUI.innerText = `SCORE: ${score}`;
+                    if (score > highScore) {
+                        highScore = score;
+                        localStorage.setItem('cyberYorkerProScore', highScore);
+                        highScoreUI.innerText = `HIGH SCORE: ${highScore}`;
+                    }
+                    
+                    target.speed += 0.3;
+                    shield.speed += 0.4;
+                    resetBall();
+                } 
+                // Missed (went off top, left, or right edges)
+                else if (ball.y < 0 || ball.x < 0 || ball.x > canvas.width) {
+                    sfx.miss();
+                    spawnFloatingText(ball.x, Math.max(100, ball.y), "MISS", "#888");
+                    resetCombo();
+                    score = 0;
+                    scoreUI.innerText = `SCORE: ${score}`;
+                    resetBall();
+                }
+            }
+
+            // Cleanup arrays
+            particles.forEach((p, i) => {
+                p.x += p.vx; p.y += p.vy; p.life -= 0.02;
+                if (p.life <= 0) particles.splice(i, 1);
+            });
+
+            trails.forEach((t, i) => {
+                t.life -= 0.15;
+                if (t.life <= 0) trails.splice(i, 1);
+            });
+
+            floatingTexts.forEach((ft, i) => {
+                ft.y += ft.dy; ft.life -= 0.02;
+                if (ft.life <= 0) floatingTexts.splice(i, 1);
+            });
+        }
+
+        function drawRect(entity) {
+            ctx.shadowBlur = 20;
+            ctx.shadowColor = entity.color;
+            ctx.fillStyle = entity.color;
+            ctx.fillRect(entity.x, entity.y, entity.width, entity.height);
+        }
+
+        function draw() {
+            ctx.fillStyle = 'rgba(2, 2, 5, 0.4)'; 
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            if (!isPlaying) return;
+
+            ctx.save();
+            if (shakeTime > 0) {
+                ctx.translate((Math.random() - 0.5) * 15, (Math.random() - 0.5) * 15);
+                shakeTime--;
+            }
+
+            drawRect(target);
+            drawRect(shield);
+
+            // Trails
+            ctx.shadowBlur = 0;
+            trails.forEach(t => {
+                ctx.beginPath();
+                ctx.arc(t.x, t.y, ball.radius * t.life, 0, Math.PI * 2);
+                ctx.fillStyle = `rgba(255, 255, 255, ${t.life})`;
+                ctx.fill();
+            });
+
+            // --- Draw Rotated Launcher ---
+            let pivotX = canvas.width / 2;
+            let pivotY = canvas.height - 15;
+            let angle = Math.atan2(pointer.y - pivotY, pointer.x - pivotX);
+
+            ctx.save();
+            ctx.translate(pivotX, pivotY);
+            ctx.rotate(angle + Math.PI / 2); // Point toward mouse/finger
+            
+            ctx.shadowBlur = 0;
+            ctx.fillStyle = gun.color;
+            ctx.fillRect(-gun.width / 2, -gun.height + gun.yOffset, gun.width, gun.height);
+            ctx.restore();
+
+            // Gun base glow
+            ctx.shadowBlur = 15;
+            ctx.shadowColor = '#0ff';
+            ctx.fillStyle = '#111';
+            ctx.fillRect(pivotX - (gun.width/2) - 15, canvas.height - 15, gun.width + 30, 15);
+
+            // Ball
+            ctx.shadowBlur = ball.isFired ? 20 : (15 + Math.sin(Date.now()/100)*10);
+            ctx.shadowColor = ball.color;
+            ctx.beginPath();
+            ctx.arc(ball.x, ball.y, ball.radius, 0, Math.PI * 2);
+            ctx.fillStyle = ball.color;
+            ctx.fill();
+
+            // Particles
+            particles.forEach(p => {
+                ctx.shadowBlur = 15;
+                ctx.shadowColor = p.color;
+                ctx.fillStyle = p.color;
+                ctx.globalAlpha = p.life;
+                ctx.beginPath();
+                ctx.arc(p.x, p.y, 3, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.globalAlpha = 1.0;
+            });
+
+            // Floating Text
+            ctx.shadowBlur = 10;
+            ctx.textAlign = "center";
+            ctx.font = "bold 24px 'Courier New'";
+            floatingTexts.forEach(ft => {
+                ctx.shadowColor = ft.color;
+                ctx.fillStyle = ft.color;
+                ctx.globalAlpha = ft.life;
+                ctx.fillText(ft.text, ft.x, ft.y);
+                ctx.globalAlpha = 1.0;
+            });
+
+            ctx.restore();
+        }
+
+        function loop() {
+            update();
+            draw();
+            requestAnimationFrame(loop);
+        }
+
+        resize();
+        loop();
+    </script>
+</body>
+</html>
+
+
